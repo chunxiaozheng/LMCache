@@ -108,6 +108,9 @@ class LMCacheEngineConfig:
     # The extra config
     extra_config: Optional[dict] = None
 
+    # LMCache is used for reuse or PD disaggregation scenarios, default for PD disaggregation
+    reuse: bool = False
+
     @staticmethod
     def from_defaults(
         chunk_size: int = 256,
@@ -141,6 +144,7 @@ class LMCacheEngineConfig:
         weka_path: Optional[str] = None,
         cufile_buffer_size: Optional[int] = None,
         extra_config: Optional[dict] = None,
+        reuse: bool = False,
     ) -> "LMCacheEngineConfig":
         # TODO (ApostaC): Add nixl config
         return LMCacheEngineConfig(
@@ -175,6 +179,7 @@ class LMCacheEngineConfig:
             weka_path,
             cufile_buffer_size,
             extra_config,
+            reuse,
         ).validate()
 
     @staticmethod
@@ -193,6 +198,7 @@ class LMCacheEngineConfig:
         lookup_url: Optional[str] = None,
         distributed_url: Optional[str] = None,
         error_handling: bool = False,
+        reuse: bool = False,
     ) -> "LMCacheEngineConfig":
         # TODO (ApostaC): Add nixl config
         if backend == "cpu":
@@ -235,22 +241,23 @@ class LMCacheEngineConfig:
             raise ValueError(f"Invalid backend: {backend}")
         return (
             LMCacheEngineConfig(
-                chunk_size,
-                local_cpu,
-                max_local_cpu_size,
-                local_disk,
-                max_local_disk_size,
-                remote_url,
-                remote_serde,
-                save_decode_cache,
-                enable_blending,
-                blend_recompute_ratio,
-                blend_min_tokens,
-                blend_special_str,
-                enable_p2p,
-                lookup_url,
-                distributed_url,
-                error_handling,
+                chunk_size=chunk_size,
+                local_cpu=local_cpu,
+                max_local_cpu_size=max_local_cpu_size,
+                local_disk=local_disk,
+                max_local_disk_size=max_local_disk_size,
+                remote_url=remote_url,
+                remote_serde=remote_serde,
+                save_decode_cache=save_decode_cache,
+                enable_blending=enable_blending,
+                blend_recompute_ratio=blend_recompute_ratio,
+                blend_min_tokens=blend_min_tokens,
+                blend_special_str=blend_special_str,
+                enable_p2p=enable_p2p,
+                lookup_url=lookup_url,
+                distributed_url=distributed_url,
+                error_handling=error_handling,
+                reuse=reuse,
             )
             .validate()
             .log_config()
@@ -329,6 +336,8 @@ class LMCacheEngineConfig:
         weka_path = config.get("weka_path", None)
         cufile_buffer_size = config.get("cufile_buffer_size", None)
 
+        reuse = config.get("reuse", False)
+
         local_disk_path = _parse_local_disk(local_disk)
 
         match remote_url:
@@ -372,6 +381,7 @@ class LMCacheEngineConfig:
                 weka_path,
                 cufile_buffer_size,
                 extra_config,
+                reuse,
             )
             .validate()
             .log_config()
@@ -542,6 +552,7 @@ class LMCacheEngineConfig:
             config.cufile_buffer_size,
         )
         config.extra_config = to_dict(parse_env(get_env_name("extra_config"), None))
+        config.reuse = to_bool(parse_env(get_env_name("reuse"), config.reuse))
         return config.validate().log_config()
 
     def to_original_config(self) -> orig_config.LMCacheEngineConfig:
@@ -621,6 +632,7 @@ class LMCacheEngineConfig:
             "nixl_enable_gc": self.nixl_enable_gc,
             "weka_path": self.weka_path,
             "extra_config": self.extra_config,
+            "reuse": self.reuse,
         }
         logger.info(f"LMCache Configuration: {config_dict}")
 

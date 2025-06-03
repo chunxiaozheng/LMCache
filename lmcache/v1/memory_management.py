@@ -14,9 +14,10 @@
 # limitations under the License.
 
 # Standard
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Tuple, Union
+from typing import Deque, Optional, Tuple, Union
 import abc
 import ctypes
 import threading
@@ -260,6 +261,13 @@ class MemoryObj(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
+    @property
+    def block_id(self) -> int:
+        """
+        Get the block id from the MemoryObj.
+        """
+        raise NotImplementedError
+
 
 class TensorMemoryObj(MemoryObj):
     """
@@ -447,6 +455,26 @@ class BytesBufferMemoryObj(MemoryObj):
     @property
     def is_pinned(self) -> bool:
         return self.metadata.is_pin
+
+
+class ReusedTensorMemoryObj(TensorMemoryObj):
+    """
+    Wraps a raw flat tensor with some metadata
+    """
+
+    def __init__(
+        self,
+        raw_data: torch.Tensor,
+        metadata: MemoryObjMetadata,
+        block_id: int,
+        parent_allocator: Optional["MemoryAllocatorInterface"] = None,
+    ):
+        super().__init__(raw_data, metadata, parent_allocator)
+        self._block_id = block_id
+
+    @property
+    def block_id(self) -> int:
+        return self._block_id
 
 
 class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
@@ -816,13 +844,19 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
               (2) byte_array buffer memory.
     """
 
-    def __init__(self, size: int):
+    def __init__(self, size: int, reuse: bool = False, block_size: int = -1):
         """
         :param int size: The size of the pinned memory in bytes.
+        :param bool reuse: The usage scenarios of LMCache.
+        :param int block_size: The bytes of full chunk block.
         """
         buffer = torch.empty(size, dtype=torch.uint8, pin_memory=True)
 
-        self.pin_allocator = TensorMemoryAllocator(buffer)
+        if reuse:
+            assert block_size > 0, "block size must bigger than 0"
+            self.pin_allocator = ReusedTensorMemoryAllocator(buffer, block_size)
+        else:
+            self.pin_allocator = TensorMemoryAllocator(buffer)
         self.buffer_allocator = BufferAllocator("cpu")
 
         self.host_mem_lock = threading.Lock()
@@ -1013,3 +1047,105 @@ class CuFileMemoryAllocator(GPUMemoryAllocator):
 
     def __del__(self):
         self.cuFileBufDeregister(ctypes.c_void_p(self.base_pointer))
+
+
+class ReusedTensorMemoryAllocator(MemoryAllocatorInterface):
+    """
+    Only block sizes of chunks are saved, so the size of all blocks is fixed.
+    """
+    def __init__(self, tensor: torch.Tensor, block_size: int):
+        self.buffer = tensor.view(torch.uint8).flatten()
+
+        self.total_size = self.buffer.numel()
+        self.block_size = block_size
+        self.num_blocks = self.total_size // self.block_size
+        self.free_blocks: Deque[int] = deque(range(self.num_blocks))
+        logger.info(f"init reused tensor memory allocator, "
+                    f"total size: {self.total_size}, "
+                    f"block size: {self.block_size}, "
+                    f"blocks: {self.num_blocks}")
+
+        self.total_allocated_size = 0
+        self.stats_monitor = LMCStatsMonitor.GetOrCreate()
+
+    def allocate(
+        self,
+        shape: Union[torch.Size, Tuple[int, ...]],
+        dtype: Optional[torch.dtype],
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        parent_allocator: Optional["MemoryAllocatorInterface"] = None,
+    ) -> Optional[TensorMemoryObj]:
+        if not self.free_blocks:
+            return None
+
+        # Allocate the block
+        if not isinstance(shape, torch.Size):
+            shape = torch.Size(shape)
+        assert dtype is not None, "dtype must be specified"
+
+        block_id = self.free_blocks.popleft()
+        self.total_allocated_size += self.block_size
+        self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
+        begin_pos = block_id * self.block_size
+        end_pos = begin_pos + self.block_size
+
+        return ReusedTensorMemoryObj(
+            raw_data=self.buffer[begin_pos : end_pos],
+            metadata=MemoryObjMetadata(
+                shape, dtype, begin_pos, self.block_size, 1, False, fmt
+            ),
+            block_id=block_id,
+            parent_allocator=parent_allocator,
+        )
+
+    def dry_allocate(
+        self,
+        shape: Union[torch.Size, Tuple[int, ...]],
+        dtype: Optional[torch.dtype],
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+    ) -> MemoryObjMetadata:
+        """
+        A 'dry run' allocation that returns the metadata of the
+        allocated memory without actually allocating it.
+        """
+        raise NotImplementedError
+
+    def free(self, memory_obj: MemoryObj):
+        if not memory_obj.is_valid():
+            return
+
+        self.free_blocks.append(memory_obj.block_id)
+        memory_obj.invalidate()
+
+        # Update debug status
+        self.total_allocated_size -= self.block_size
+        self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
+
+    def memcheck(self):
+        """For debug purposes.
+        Returns True is everything is fine, otherwise False.
+        """
+        clear = True
+        logger.info("Checking memory allocator consistency")
+        logger.info(
+            f" - Total allocated size: {self.total_allocated_size / 1048576} MB"
+        )
+
+        # Check the real total free size
+        total_free_size = self.block_size * len(self.free_blocks)
+        logger.info(f" - Total free size: {total_free_size / 1048576} MB")
+
+        # Check if the numbers are consistent
+        if self.total_size - total_free_size - self.total_allocated_size >= self.block_size:
+            logger.error(f"Memory allocator size is inconsistent, "
+                         f"total size: {self.total_size}, "
+                         f"current free size: {total_free_size}, "
+                         f"current allocate size: {self.total_allocated_size}, "
+                         f"block size: {self.block_size}")
+            logger.error("This implies a bug in the memory allocator")
+            clear = False
+
+        return clear
+
+    def __del__(self):
+        del self.buffer

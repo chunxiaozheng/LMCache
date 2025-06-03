@@ -12,8 +12,9 @@ from lmcache.v1.token_database import ChunkedTokenDatabase, SegmentTokenDatabase
 
 
 @pytest.mark.parametrize("chunk_length", [16, 64, 256])
-def test_chunked_token_database(chunk_length):
-    cfg = LMCacheEngineConfig.from_legacy(chunk_size=chunk_length, backend="cpu")
+@pytest.mark.parametrize("reuse", [False, True])
+def test_chunked_token_database(chunk_length, reuse):
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=chunk_length, backend="cpu", reuse=reuse)
     metadata = dumb_metadata()
 
     test_length = 2500
@@ -26,10 +27,14 @@ def test_chunked_token_database(chunk_length):
 
     # Process without mask
     original_results = list(db.process_tokens(tokens))
-    for i in range(0, test_length, chunk_length):
+    end = (test_length - test_length % chunk_length) if reuse else test_length
+    for i in range(0, end, chunk_length):
         st, ed, key = original_results[i // chunk_length]
         assert st == i
-        assert ed == min(i + chunk_length, test_length)
+        if reuse:
+            assert ed == i + chunk_length
+        else:
+            assert ed == min(i + chunk_length, test_length)
 
     for i in range(0, test_length // chunk_length):
         mask[: num_falses[i]] = False

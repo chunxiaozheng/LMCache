@@ -760,7 +760,9 @@ class LMCacheEngineBuilder:
             return CuFileMemoryAllocator(config.cufile_buffer_size * 1024**2)
 
         max_local_cpu_size = config.max_local_cpu_size
-        return MixedMemoryAllocator(int(max_local_cpu_size * 1024**3))
+        reuse = config.reuse
+        block_size = LMCacheEngineBuilder._Get_chunk_block_size(metadata)
+        return MixedMemoryAllocator(int(max_local_cpu_size * 1024**3), reuse, block_size)
 
     @staticmethod
     def _Create_token_database(
@@ -768,6 +770,15 @@ class LMCacheEngineBuilder:
         metadata: LMCacheEngineMetadata,
     ) -> TokenDatabase:
         return ChunkedTokenDatabase(config, metadata)
+
+    @staticmethod
+    def _Get_chunk_block_size(metadata: LMCacheEngineMetadata) -> int:
+        """Get the size of the chunk block in bytes."""
+        dtype_size = torch.tensor([], dtype=metadata.kv_dtype).element_size()
+        num_elements = 1
+        for dim in metadata.kv_shape:
+            num_elements *= dim
+        return dtype_size * num_elements
 
     @classmethod
     def get_or_create(
