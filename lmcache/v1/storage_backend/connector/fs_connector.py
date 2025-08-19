@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List, Optional, no_type_check
 import asyncio
 import os
+import xattr
 
 # Third Party
 import aiofiles
@@ -158,6 +159,12 @@ class FSConnector(RemoteConnector):
 
             # Atomically rename temp file to final destination
             await aiofiles.os.replace(temp_path, final_path)
+
+            # set xattr
+            if hasattr(key, "extra_configs") and key.extra_configs is not None:
+                for k, v in key.extra_configs.items():
+                    if k.startswith("lmcache.remote.xattr."):
+                        xattr.setxattr(final_path, k[len("lmcache.remote.xattr.") :], v)
 
         except Exception as e:
             logger.error(f"Failed to write file {final_path}: {str(e)}")
