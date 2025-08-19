@@ -161,10 +161,14 @@ class FSConnector(RemoteConnector):
             await aiofiles.os.replace(temp_path, final_path)
 
             # set xattr
-            if hasattr(key, "extra_configs") and key.extra_configs is not None:
-                for k, v in key.extra_configs.items():
+            if hasattr(key, "request_configs") and key.request_configs is not None:
+                for k, v in key.request_configs.items():
                     if k.startswith("lmcache.remote.xattr."):
-                        xattr.setxattr(final_path, k[len("lmcache.remote.xattr.") :], v)
+                        xattr.setxattr(
+                            final_path,
+                            k[len("lmcache.remote.xattr.") :],
+                            str(v).encode("utf-8")
+                        )
 
         except Exception as e:
             logger.error(f"Failed to write file {final_path}: {str(e)}")
