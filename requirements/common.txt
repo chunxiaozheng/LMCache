@@ -15,6 +15,7 @@ safetensors
 setuptools>=77.0.3,<81.0.0
 setuptools_scm>=8
 sortedcontainers
+xattr
 # 1. avoid pinning torch version in the runtime dependencies so that 
 # installing lmcache (from source or from pypi) will not override
 # the user's preexisting torch version 
