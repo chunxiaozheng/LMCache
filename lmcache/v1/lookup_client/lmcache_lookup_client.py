@@ -28,8 +28,11 @@ class LMCacheLookupClient(LookupClientInterface):
     ZMQ-based lookup client that communicates with a lookup server.
 
     Related extra_config:
-    - create_lookup_server_only_on_worker_0_for_mla:
-        is a flag to control whether to create lookup server only on worker 0.
+    - create_lookup_server_only_on_one_worker_for_mla:
+        is a flag to control whether to create lookup server only on one worker.
+    - lookup_server_rank:
+        if create_lookup_server_only_on_one_worker_for_mla is True, start lookup
+        server on lookup_server_rank, default is 0.
     """
 
     def __init__(self, vllm_config: "VllmConfig", config: LMCacheEngineConfig):
@@ -39,17 +42,19 @@ class LMCacheLookupClient(LookupClientInterface):
             "lmcache_rpc_port", 0
         )
         self.tensor_parallel_size = vllm_config.parallel_config.tensor_parallel_size
-        self.create_lookup_server_only_on_worker_0_for_mla = (
+        self.create_lookup_server_only_on_one_worker_for_mla = (
             config.extra_config
             and config.extra_config.get(
-                "create_lookup_server_only_on_worker_0_for_mla", False
+                "create_lookup_server_only_on_one_worker_for_mla", False
             )
         )
         ranks = self.tensor_parallel_size
-        self.sockets = []
-        if self.create_lookup_server_only_on_worker_0_for_mla:
+        if self.create_lookup_server_only_on_one_worker_for_mla:
             ranks = 1
+        self.sockets = []
         for tp_rank in range(ranks):
+            if self.create_lookup_server_only_on_one_worker_for_mla:
+                tp_rank = config.extra_config.get("lookup_server_rank", 0)
             socket_path = get_zmq_rpc_path_lmcache(
                 vllm_config, "lookup", rpc_port, tp_rank
             )
@@ -75,7 +80,7 @@ class LMCacheLookupClient(LookupClientInterface):
             tags_str = "@".join([f"{k}%{v}" for k, v in tags.items()])
         tags_buf = tags_str.encode("utf-8")
         ranks = self.tensor_parallel_size
-        if self.create_lookup_server_only_on_worker_0_for_mla:
+        if self.create_lookup_server_only_on_one_worker_for_mla:
             ranks = 1
         results = []
         msg_buf = token_bufs + [lookup_id_buf, tags_buf]
@@ -157,6 +162,7 @@ class LMCacheLookupServer:
                 #    break
                 # continue
 
+        logger.info(f"start lookup server on: {socket_path}")
         self.thread = threading.Thread(target=process_request, daemon=True)
         self.thread.start()
 
