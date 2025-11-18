@@ -614,6 +614,40 @@ class P2PBackend(StorageBackendInterface):
             except Exception as e:
                 logger.error("Error cleaning up memory object: %s", e)
 
+    def batched_contains(
+        self,
+        keys: List[CacheEngineKey],
+        pin: bool = False,
+        lookup_id: Optional[str] = None,
+    ) -> int:
+        assert lookup_id is not None
+        future = asyncio.run_coroutine_threadsafe(
+            self.batched_async_contains(lookup_id, keys, pin), self.loop
+        )
+        try:
+            hit_chunks = future.result()
+        except Exception as e:
+            logger.warning(f"Error in batched contains: {e}")
+            hit_chunks = 0
+        return hit_chunks
+
+    def batched_get_blocking(
+        self,
+        keys: List[CacheEngineKey],
+        lookup_id: Optional[str] = None,
+        transfer_spec: Any = None,
+    ) -> List[Optional[MemoryObj]]:
+        assert lookup_id is not None
+        future = asyncio.run_coroutine_threadsafe(
+            self.batched_get_non_blocking(lookup_id, keys, transfer_spec), self.loop
+        )
+        try:
+            memory_objs = future.result()
+        except Exception as e:
+            logger.warning(f"Error in batched get blocking: {e}")
+            memory_objs = [None] * len(keys)
+        return memory_objs
+
     def close(
         self,
     ) -> None:

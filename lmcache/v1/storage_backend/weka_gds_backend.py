@@ -459,6 +459,8 @@ class WekaGdsBackend(AllocatorBackendInterface):
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
+        lookup_id: Optional[str] = None,
+        transfer_spec: Any = None,
     ) -> list[MemoryObj | None]:
         paths: list[str | None] = []
         dtypes: list[torch.dtype | None] = []

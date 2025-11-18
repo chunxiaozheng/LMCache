@@ -453,6 +453,8 @@ class StorageManager:
         self,
         keys: List[CacheEngineKey],
         location: Optional[str] = None,
+        lookup_id: Optional[str] = None,
+        transfer_spec: Any = None,
     ) -> Optional[List[Optional[MemoryObj]]]:
         """
         Blocking function to get the memory objects from the storages.
@@ -461,7 +463,9 @@ class StorageManager:
         for backend_name, storage_backend in self.storage_backends.items():
             if location and backend_name != location:
                 continue
-            memory_objs = storage_backend.batched_get_blocking(keys)
+            memory_objs = storage_backend.batched_get_blocking(
+                keys, lookup_id, transfer_spec
+            )
             if memory_objs:
                 return memory_objs
         return None
@@ -749,6 +753,7 @@ class StorageManager:
         keys: List[CacheEngineKey],
         search_range: Optional[List[str]] = None,
         pin: bool = False,
+        lookup_id: Optional[str] = None,
     ) -> int:
         """
         Check whether the key exists in the storage backend.
@@ -762,6 +767,8 @@ class StorageManager:
 
         :param bool pin: Whether to pin the key.
 
+        :param Optional[str] lookup_id: The lookup id.
+
         return: Return hit chunks by prefix match.
         """
         total_keys = len(keys)
@@ -770,7 +777,7 @@ class StorageManager:
             if search_range and backend_name not in search_range:
                 continue
 
-            hit_chunks = backend.batched_contains(keys, pin)
+            hit_chunks = backend.batched_contains(keys, pin, lookup_id)
             if hit_chunks == 0:
                 continue
             total_hit_chunks += hit_chunks
@@ -781,13 +788,17 @@ class StorageManager:
         return total_hit_chunks
 
     def get_block_mapping(
-        self, chunk_infos: List[Tuple[CacheEngineKey, int, int]]
+        self,
+        chunk_infos: List[Tuple[CacheEngineKey, int, int]],
+        lookup_id: Optional[str] = None
     ) -> Dict[str, List[Tuple[CacheEngineKey, int, int]]]:
         """
         Get block mapping for the given chunk infos, works by prefix match.
 
         :param List[Tuple[CacheEngineKey, int, int]] chunk_infos:
         List of chunk infos, each tuple contains (key, begin, end)
+
+        :param Optional[str] lookup_id: The lookup id.
 
         :return: Dict[str, List[Tuple[CacheEngineKey, int, int]]]:
         Block mapping for the given chunk infos, each key is the backend name,
@@ -798,7 +809,7 @@ class StorageManager:
         block_mapping = {}
         total_hit_chunks = 0
         for backend_name, backend in self.storage_backends.items():
-            hit_chunks = backend.batched_contains(keys)
+            hit_chunks = backend.batched_contains(keys, lookup_id=lookup_id)
             if hit_chunks == 0:
                 continue
             block_mapping[backend_name] = chunk_infos[
