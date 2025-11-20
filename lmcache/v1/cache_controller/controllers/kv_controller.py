@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections import defaultdict, deque
 from dataclasses import dataclass
 
 # First Party
@@ -37,19 +38,29 @@ class KVChunkMetadata:
     worker_id: int
     location: str
 
+    def __hash__(self) -> int:
+        """
+        Hash method.
+        """
+        return hash((self.instance_id, self.worker_id, self.location))
 
-# TODO(Jiayi): Need more efficient data structures (e.g., trie)
-# to handle these operations (e.g., evict, deregister)
-# more efficiently.
+    def __eq__(self, other) -> bool:
+        """
+        Equality comparison method.
+        """
+        if not isinstance(other, KVChunkMetadata):
+            return False
+        return (
+            self.instance_id == other.instance_id
+            and self.worker_id == other.worker_id
+            and self.location == other.location
+        )
 
 
 class KVController:
     def __init__(self) -> None:
-        # NOTE (Jiayi): Even if we offload kv_pool to
-        # redis. We might need a local cache for handling
-        # messages like `check_finish`. Or everything should be
-        # written to redis.
-        self.kv_pool: dict[int, list[KVChunkMetadata]] = {}
+        self.kv_pool: dict[int, deque[KVChunkMetadata]] = defaultdict(deque)
+        self.reverse_index: dict[KVChunkMetadata, set[int]] = defaultdict(set)
         # TODO(Jiayi): remove this hardcode
         self.token_database = ChunkedTokenDatabase()
         self._setup_metrics()
@@ -70,40 +81,36 @@ class KVController:
         """
         Admit a new kv chunk.
         """
-        instance_id = msg.instance_id
-        worker_id = msg.worker_id
-        key = msg.key
-        location = msg.location
-        if key not in self.kv_pool:
-            self.kv_pool[key] = []
-        self.kv_pool[key].append(KVChunkMetadata(instance_id, worker_id, location))
+        chunk_meta = KVChunkMetadata(msg.instance_id, msg.worker_id, msg.location)
+        self.kv_pool[msg.key].append(chunk_meta)
+        self.reverse_index[chunk_meta].add(msg.key)
 
     async def evict(self, msg: KVEvictMsg) -> None:
         """
         Evict a kv chunk.
         """
-        instance_id = msg.instance_id
-        worker_id = msg.worker_id
+        chunk_meta = KVChunkMetadata(msg.instance_id, msg.worker_id, msg.location)
         key = msg.key
-        location = msg.location
 
         if key not in self.kv_pool:
             return
 
-        remaining = [
-            m
-            for m in self.kv_pool[key]
-            if not (
-                m.instance_id == instance_id
-                and m.worker_id == worker_id
-                and m.location == location
-            )
-        ]
+        try:
+            self.kv_pool[key].remove(chunk_meta)
+        except ValueError:
+            pass
+        try:
+            self.reverse_index[chunk_meta].remove(key)
+        except KeyError:
+            pass
 
-        if remaining:
-            self.kv_pool[key] = remaining
-        else:
+        if len(self.kv_pool[key]) == 0:
             del self.kv_pool[key]
+        if (
+            chunk_meta in self.reverse_index
+            and len(self.reverse_index[chunk_meta]) == 0
+        ):
+            del self.reverse_index[chunk_meta]
 
     async def clear(self, msg: ClearMsg) -> ClearRetMsg:
         """
@@ -145,14 +152,23 @@ class KVController:
         """
         Deregister all kv chunks of an instance-worker.
         """
-        for key in self.kv_pool:
-            self.kv_pool[key] = [
-                m
-                for m in self.kv_pool[key]
-                if not (m.instance_id == instance_id and m.worker_id == worker_id)
-            ]
-            if not self.kv_pool[key]:
-                del self.kv_pool[key]
+        for chunk_meta, keys in list(self.reverse_index.items()):
+            if (
+                chunk_meta.instance_id == instance_id
+                and chunk_meta.worker_id == worker_id
+            ):
+                # delete the key from the kv pool
+                for key in keys:
+                    if key not in self.kv_pool:
+                        continue
+
+                    self.kv_pool[key].remove(chunk_meta)
+
+                    if len(self.kv_pool[key]) == 0:
+                        del self.kv_pool[key]
+
+                # delete the reverse index
+                del self.reverse_index[chunk_meta]
 
     # TODO(Jiayi): The current implementation does not handle
     # the case where the prefix chunks are evicted while the
