@@ -90,6 +90,8 @@ class ReverseIndexKVController(KVController):
                     self.reverse_index[key].remove(chunk_meta)
                 except ValueError:
                     pass
+                if not self.reverse_index[key]:
+                    del self.reverse_index[key]
         await super().deregister(instance_id, worker_id)
 
     async def lookup(self, msg: LookupMsg) -> LookupRetMsg:
