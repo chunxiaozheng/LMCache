@@ -27,6 +27,14 @@ from lmcache.v1.cache_controller.message import (
 from lmcache.v1.cache_controller.observability import PrometheusLogger
 from lmcache.v1.token_database import ChunkedTokenDatabase
 
+"""
+The kv controller use `(instance_id, worker_id)` -> [location -> set[chunk_hash]] 
+as kv_pool. When the the number of instance is small and stable, the time complexity 
+of `lookup` in kv controller is O(n). If the number of instance is large or unknown, 
+the time complexity will degrade to O(n^2), and the ReverseIndexKVController is a 
+better choice.
+"""
+
 
 class KVController:
     def __init__(self) -> None:
@@ -144,6 +152,7 @@ class KVController:
             layout_info[matched_instance] = (matched_location, end)
         return LookupRetMsg(layout_info=layout_info, event_id=msg.event_id)
 
+    # TODO: improve the matching logic, return multi results
     async def batched_p2p_lookup(
         self, msg: BatchedP2PLookupMsg
     ) -> BatchedP2PLookupRetMsg:
@@ -182,6 +191,18 @@ class KVController:
         exclude_instance_id: Optional[str] = None,
         exclude_location: Optional[str] = None,
     ) -> Optional[tuple[str, int, str]]:
+        """
+        Check if a key exists in the KV pool.
+
+        :param int key: The key to check.
+
+        :param str exclude_instance_id: The instance ID to exclude.
+
+        :param str exclude_location: The location to exclude.
+
+        :return: A tuple of (instance_id, worker_id, location) if the key exists,
+        None otherwise.
+        """
         for (instance_id, worker_id), location_kvs in self.kv_pool.items():
             for location, kvs in location_kvs.items():
                 if (

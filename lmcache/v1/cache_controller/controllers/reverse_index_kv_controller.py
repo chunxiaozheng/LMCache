@@ -47,6 +47,13 @@ class KVChunkMetadata:
         )
 
 
+"""
+The reverse index kv controller is a kv controller that maintains a reverse index.
+When the the number of instance is unknown or large, the time complexity of `lookup` 
+in normal kv controller is O(n^2), while the reverse index kv controller is O(n). 
+"""
+
+
 class ReverseIndexKVController(KVController):
     def __init__(self):
         super().__init__()
