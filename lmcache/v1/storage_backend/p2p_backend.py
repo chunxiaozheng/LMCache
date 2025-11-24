@@ -166,6 +166,7 @@ class P2PBackend(StorageBackendInterface):
         # A lookup_id -> (peer_init_url, peer_lookup_url, location)
         self.lookup_id_to_peer_mapping: dict[str, tuple[str, str, str]] = {}
 
+        self.enable_async_loading = config.enable_async_loading
         # TODO: if lookup cache implemented, we can remove this.
         # A `lookup_id -> number of hit chunks` for sync loading.
         # In sync loading, `batched_contains` will be called twice, the first is
@@ -290,19 +291,20 @@ class P2PBackend(StorageBackendInterface):
                     self.peer_id_to_lookup_url_mapping[peer_init_url],
                     location,
                 )
-                # pin
-                pin_count = await self._pin_remote_chunk(
-                    keys[:num_hit_chunks], lookup_id
-                )
-                if num_hit_chunks != pin_count:
-                    logger.info(
-                        "lookup id: %s, lookup result from controller is %s, "
-                        "while pin count is %s",
-                        lookup_id,
-                        num_hit_chunks,
-                        pin_count,
+                # pin for sync loading
+                if pin and not self.enable_async_loading:
+                    pin_count = await self._pin_remote_chunk(
+                        keys[:num_hit_chunks], lookup_id
                     )
-                    num_hit_chunks = pin_count
+                    if num_hit_chunks != pin_count:
+                        logger.info(
+                            "lookup id: %s, lookup result from "
+                            "controller is %s, while pin count is %s",
+                            lookup_id,
+                            num_hit_chunks,
+                            pin_count,
+                        )
+                        num_hit_chunks = pin_count
             except Exception as e:
                 logger.error(
                     "Failed to ensure peer connection for lookup_id %s: %s",
@@ -382,7 +384,11 @@ class P2PBackend(StorageBackendInterface):
             msg_bytes = await self.async_peer_socket.recv()
             msg = msgspec.msgpack.decode(msg_bytes, type=P2PMsg)
 
-            num_tokens = len(msg.mem_indexes) * self.chunk_size
+            num_tokens = (
+                (len(msg.mem_indexes) * self.chunk_size)
+                if hasattr(msg, "mem_indexes")
+                else 0
+            )
             monitor_req_id = self.stats_monitor.on_p2p_transfer_request(num_tokens)
 
             if isinstance(msg, BatchedLookupAndGetMsg):
@@ -391,20 +397,28 @@ class P2PBackend(StorageBackendInterface):
                 lookup_id = msg.lookup_id
                 receiver_id = msg.receiver_id
                 remote_mem_indexes = msg.mem_indexes
-                keys = [CacheEngineKey.from_string(key) for key in msg.keys]
 
-                # TODO(Jiayi): Optimally, there's no need to use async call
-                # for some backends (e.g., local cpu) as there's overhead for
-                # async function call.
-                num_hit_chunks = await self.local_cpu_backend.batched_async_contains(
-                    lookup_id=lookup_id,
-                    keys=keys,
-                    pin=True,
-                )
+                if self.enable_async_loading:
+                    keys = [CacheEngineKey.from_string(key) for key in msg.keys]
+                    # TODO(Jiayi): Optimally, there's no need to use async call
+                    # for some backends (e.g., local cpu) as there's overhead for
+                    # async function call.
+                    num_hit_chunks = (
+                        await self.local_cpu_backend.batched_async_contains(
+                            lookup_id=lookup_id,
+                            keys=keys,
+                            pin=True,
+                        )
+                    )
+                    keys = keys[:num_hit_chunks]
+                else:
+                    keys = self.pin_keys[lookup_id]
+                    num_hit_chunks = len(keys)
+                    del self.pin_keys[lookup_id]
 
                 mem_objs = await self.local_cpu_backend.batched_get_non_blocking(
                     lookup_id=lookup_id,
-                    keys=keys[:num_hit_chunks],
+                    keys=keys,
                 )
 
                 channel_transfer_spec = {
@@ -423,11 +437,6 @@ class P2PBackend(StorageBackendInterface):
                 for mem_obj in mem_objs:
                     mem_obj.ref_count_down()
                     mem_obj.unpin()
-
-                if lookup_id in self.pin_keys:
-                    for key in self.pin_keys[lookup_id]:
-                        self.local_cpu_backend.unpin(key)
-                    del self.pin_keys[lookup_id]
             elif isinstance(msg, BatchedLookupAndPutMsg):
                 logger.info("Received P2P batched put msg")
 
@@ -609,7 +618,9 @@ class P2PBackend(StorageBackendInterface):
                 torch.Size(shape), self.dtype, self.fmt
             )
             mem_objs.append(mem_obj)
-            str_keys.append(key.to_string())
+            # sync loading do not need key_strs, only async loading needs it
+            if self.enable_async_loading:
+                str_keys.append(key.to_string())
 
         local_indexes = self.transfer_channel.get_local_mem_indices(mem_objs)
 
