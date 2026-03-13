@@ -497,6 +497,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
             "and environment variables."
         ),
     },
+    "contiguous_alloc": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+    },
 }
 
 
