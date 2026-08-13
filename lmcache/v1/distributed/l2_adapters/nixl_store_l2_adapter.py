@@ -325,26 +325,25 @@ class FileNixlStorageAgent(NixlStorageAgent):
         l1_memory_desc: L1MemoryDesc,
     ) -> None:
         super().__init__(device, backend, backend_params, pool_size, l1_memory_desc)
-        self.file_path = backend_params["file_path"]
-        self.file_size = int(
-            backend_params.get("file_size", l1_memory_desc.align_bytes)
-        )
-        self.use_direct_io = str(backend_params["use_direct_io"]).lower() == "true"
-        if self.file_size % l1_memory_desc.align_bytes != 0:
-            raise ValueError(
-                "file_size (%d) must be a multiple of page_size (%d)"
-                % (self.file_size, l1_memory_desc.align_bytes)
-            )
-        self.pages_per_file = self.file_size // l1_memory_desc.align_bytes
-        self.pool = NixlObjPool(num_total_objs=pool_size * self.pages_per_file)
         self.init_storage_handlers()
 
     def init_storage_handlers(self) -> None:
         """Create, register, and prepare the pre-allocated storage files."""
-        os.makedirs(self.file_path, exist_ok=True)
+        file_path = self.backend_params["file_path"]
+        file_size = int(self.backend_params.get("file_size", self.l1_align_bytes))
+        use_direct_io = str(self.backend_params["use_direct_io"]).lower() == "true"
+        if file_size % self.l1_align_bytes != 0:
+            raise ValueError(
+                "file_size (%d) must be a multiple of page_size (%d)"
+                % (file_size, self.l1_align_bytes)
+            )
+        pages_per_file = file_size // self.l1_align_bytes
+        self.pool = NixlObjPool(num_total_objs=self.pool_size * pages_per_file)
+
+        os.makedirs(file_path, exist_ok=True)
         fds: list[int] = []
         flags = os.O_CREAT | os.O_RDWR
-        if self.use_direct_io:
+        if use_direct_io:
             if hasattr(os, "O_DIRECT"):
                 flags |= os.O_DIRECT
             else:
@@ -354,14 +353,14 @@ class FileNixlStorageAgent(NixlStorageAgent):
                 )
         for index in range(self.pool_size):
             filename = f"obj_{index}_{uuid.uuid4().hex[0:4]}.bin"
-            fd = os.open(os.path.join(self.file_path, filename), flags)
+            fd = os.open(os.path.join(file_path, filename), flags)
             fds.append(fd)
 
-        reg_list = [(0, self.file_size, fd, "") for fd in fds]
+        reg_list = [(0, file_size, fd, "") for fd in fds]
         xfer_desc = []
         for page_index in range(self.pool.total_objs):
-            fd = fds[page_index // self.pages_per_file]
-            offset = (page_index % self.pages_per_file) * self.l1_align_bytes
+            fd = fds[page_index // pages_per_file]
+            offset = (page_index % pages_per_file) * self.l1_align_bytes
             xfer_desc.append((offset, self.l1_align_bytes, fd))
         self.storage_reg_descs = self.nixl_agent.register_memory(
             reg_list, mem_type="FILE"
@@ -387,11 +386,11 @@ class ObjectNixlStorageAgent(NixlStorageAgent):
         l1_memory_desc: L1MemoryDesc,
     ) -> None:
         super().__init__(device, backend, backend_params, pool_size, l1_memory_desc)
-        self.pool = NixlObjPool(num_total_objs=pool_size)
         self.init_storage_handlers()
 
     def init_storage_handlers(self) -> None:
         """Register and prepare the pre-allocated object descriptors."""
+        self.pool = NixlObjPool(num_total_objs=self.pool_size)
         keys = [
             f"obj_{index}_{uuid.uuid4().hex[0:4]}" for index in range(self.pool_size)
         ]
