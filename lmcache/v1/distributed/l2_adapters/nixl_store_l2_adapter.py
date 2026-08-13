@@ -144,10 +144,6 @@ class NixlObjPool:
 
 
 class NixlStorageAgent(ABC):
-    pool: NixlObjPool
-    storage_reg_descs: nixlBind.nixlRegDList
-    storage_xfer_handler: NixlDlistHandle
-
     def __init__(
         self,
         device: str,
@@ -181,12 +177,16 @@ class NixlStorageAgent(ABC):
         self.nixl_agent = NixlAgent(self.agent_name, nixl_conf)
         self.nixl_agent.create_backend(backend, backend_params)
 
-        self.init_mem_handlers(
+        self.mem_reg_descs, self.mem_xfer_handler = self.init_mem_handlers(
             self.device,
             l1_memory_desc.ptr,
             l1_memory_desc.size,
             l1_memory_desc.align_bytes,
             device_id=0,  # 0 indicates cpu
+        )
+
+        self.pool, self.storage_reg_descs, self.storage_xfer_handler = (
+            self.init_storage_handlers()
         )
 
     def init_mem_handlers(
@@ -196,7 +196,7 @@ class NixlStorageAgent(ABC):
         buffer_size: int,
         page_size: int,
         device_id: int,
-    ) -> None:
+    ) -> tuple[nixlBind.nixlRegDList, NixlDlistHandle]:
         """
         Initialize memory handlers for the given device and buffer.
         """
@@ -216,9 +216,7 @@ class NixlStorageAgent(ABC):
         xfer_handler = self.nixl_agent.prep_xfer_dlist(
             "", xfer_descs, mem_type=mem_type
         )
-
-        self.mem_reg_descs = reg_descs
-        self.mem_xfer_handler = xfer_handler
+        return reg_descs, xfer_handler
 
     def get_mem_to_storage_handle(
         self, mem_indices: list[int], storage_indices: list[int]
@@ -309,7 +307,9 @@ class NixlStorageAgent(ABC):
             os.close(fd)
 
     @abstractmethod
-    def init_storage_handlers(self) -> None:
+    def init_storage_handlers(
+        self,
+    ) -> tuple[NixlObjPool, nixlBind.nixlRegDList, NixlDlistHandle]:
         """Register this agent's pre-allocated storage with NIXL."""
 
 
@@ -325,10 +325,12 @@ class FileNixlStorageAgent(NixlStorageAgent):
         l1_memory_desc: L1MemoryDesc,
     ) -> None:
         super().__init__(device, backend, backend_params, pool_size, l1_memory_desc)
-        self.init_storage_handlers()
 
-    def init_storage_handlers(self) -> None:
+    def init_storage_handlers(
+        self,
+    ) -> tuple[NixlObjPool, nixlBind.nixlRegDList, NixlDlistHandle]:
         """Create, register, and prepare the pre-allocated storage files."""
+        logger.info("Init FILE storage handlers for %s", self.agent_name)
         file_path = self.backend_params["file_path"]
         file_size = int(self.backend_params.get("file_size", self.l1_align_bytes))
         use_direct_io = str(self.backend_params["use_direct_io"]).lower() == "true"
@@ -338,7 +340,7 @@ class FileNixlStorageAgent(NixlStorageAgent):
                 % (file_size, self.l1_align_bytes)
             )
         pages_per_file = file_size // self.l1_align_bytes
-        self.pool = NixlObjPool(num_total_objs=self.pool_size * pages_per_file)
+        pool = NixlObjPool(num_total_objs=self.pool_size * pages_per_file)
 
         os.makedirs(file_path, exist_ok=True)
         fds: list[int] = []
@@ -362,16 +364,14 @@ class FileNixlStorageAgent(NixlStorageAgent):
             fd = fds[page_index // pages_per_file]
             offset = (page_index % pages_per_file) * self.l1_align_bytes
             xfer_desc.append((offset, self.l1_align_bytes, fd))
-        self.storage_reg_descs = self.nixl_agent.register_memory(
-            reg_list, mem_type="FILE"
+        storage_reg_descs = self.nixl_agent.register_memory(reg_list, mem_type="FILE")
+        storage_xfer_descs = self.nixl_agent.get_xfer_descs(xfer_desc, mem_type="FILE")
+        storage_xfer_handler = self.nixl_agent.prep_xfer_dlist(
+            self.agent_name, storage_xfer_descs, mem_type="FILE"
         )
-        self.storage_xfer_descs = self.nixl_agent.get_xfer_descs(
-            xfer_desc, mem_type="FILE"
-        )
-        self.storage_xfer_handler = self.nixl_agent.prep_xfer_dlist(
-            self.agent_name, self.storage_xfer_descs, mem_type="FILE"
-        )
+        # Used for tests
         self.storage_fds = fds
+        return pool, storage_reg_descs, storage_xfer_handler
 
 
 class ObjectNixlStorageAgent(NixlStorageAgent):
@@ -386,11 +386,13 @@ class ObjectNixlStorageAgent(NixlStorageAgent):
         l1_memory_desc: L1MemoryDesc,
     ) -> None:
         super().__init__(device, backend, backend_params, pool_size, l1_memory_desc)
-        self.init_storage_handlers()
 
-    def init_storage_handlers(self) -> None:
+    def init_storage_handlers(
+        self,
+    ) -> tuple[NixlObjPool, nixlBind.nixlRegDList, NixlDlistHandle]:
         """Register and prepare the pre-allocated object descriptors."""
-        self.pool = NixlObjPool(num_total_objs=self.pool_size)
+        logger.info("Init OBJ storage handlers for %s", self.agent_name)
+        pool = NixlObjPool(num_total_objs=self.pool_size)
         keys = [
             f"obj_{index}_{uuid.uuid4().hex[0:4]}" for index in range(self.pool_size)
         ]
@@ -398,15 +400,12 @@ class ObjectNixlStorageAgent(NixlStorageAgent):
             (0, self.l1_align_bytes, index, key) for index, key in enumerate(keys)
         ]
         xfer_desc = [(0, self.l1_align_bytes, index) for index in range(self.pool_size)]
-        self.storage_reg_descs = self.nixl_agent.register_memory(
-            reg_list, mem_type="OBJ"
+        storage_reg_descs = self.nixl_agent.register_memory(reg_list, mem_type="OBJ")
+        storage_xfer_descs = self.nixl_agent.get_xfer_descs(xfer_desc, mem_type="OBJ")
+        storage_xfer_handler = self.nixl_agent.prep_xfer_dlist(
+            self.agent_name, storage_xfer_descs, mem_type="OBJ"
         )
-        self.storage_xfer_descs = self.nixl_agent.get_xfer_descs(
-            xfer_desc, mem_type="OBJ"
-        )
-        self.storage_xfer_handler = self.nixl_agent.prep_xfer_dlist(
-            self.agent_name, self.storage_xfer_descs, mem_type="OBJ"
-        )
+        return pool, storage_reg_descs, storage_xfer_handler
 
 
 def _create_nixl_storage_agent(
