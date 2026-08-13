@@ -7,11 +7,13 @@ persist, secondary lookup, and capacity management.
 """
 
 # Standard
+import asyncio
 import inspect
 import os
 import select
 import shutil
 import tempfile
+import threading
 
 # Third Party
 import pytest
@@ -26,12 +28,16 @@ from lmcache.v1.distributed.internal_api import (  # noqa: E402
     L1MemoryDesc,
     L2AdapterListener,
 )
+from lmcache.v1.distributed.l2_adapters import (  # noqa: E402
+    nixl_store_dynamic_l2_adapter as dynamic_nixl_module,
+)
 from lmcache.v1.distributed.l2_adapters.config import PersistConfig  # noqa: E402
 from lmcache.v1.distributed.l2_adapters.nixl_store_dynamic_l2_adapter import (  # noqa: E402
     DynamicNixlStorageAgent,
     DynamicNixlStoreL2Adapter,
     DynamicNixlStoreL2AdapterConfig,
     FileDynamicNixlStorageAgent,
+    ObjectDynamicNixlStorageAgent,
     _object_key_to_filename,
 )
 from lmcache.v1.memory_management import (  # noqa: E402
@@ -88,6 +94,8 @@ def test_dynamic_nixl_storage_agent_is_abstract() -> None:
     assert inspect.isabstract(DynamicNixlStorageAgent)
     assert issubclass(FileDynamicNixlStorageAgent, DynamicNixlStorageAgent)
     assert not inspect.isabstract(FileDynamicNixlStorageAgent)
+    assert issubclass(ObjectDynamicNixlStorageAgent, DynamicNixlStorageAgent)
+    assert not inspect.isabstract(ObjectDynamicNixlStorageAgent)
 
 
 # =============================================================================
@@ -972,3 +980,254 @@ class TestPersistAndSecondaryLookup:
             assert not os.path.exists(data_file)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# =============================================================================
+# OBJ Backend Tests
+# =============================================================================
+
+
+class _FakeNixlApi:
+    """Minimal NIXL fake for dynamic object registration and lookup tests."""
+
+    def __init__(self) -> None:
+        self.register_memory_calls: list[
+            tuple[list[tuple[int, int, int, str]], str]
+        ] = []
+        self.xfer_desc_calls: list[tuple[list[tuple[int, int, int]], str]] = []
+        self.query_memory_calls: list[
+            tuple[list[tuple[int, int, int, str]], str, str]
+        ] = []
+        self.make_xfer_calls: list[tuple[str, list[int], list[int]]] = []
+        self.released_handles: list[str] = []
+        self.released_dlists: list[str] = []
+        self.deregistered: list[str] = []
+        self.query_response: list[object | None] = [object()]
+
+    def register_memory(
+        self, reg_list: list[tuple[int, int, int, str]], mem_type: str
+    ) -> str:
+        self.register_memory_calls.append((reg_list, mem_type))
+        return f"reg-{len(self.register_memory_calls)}"
+
+    def get_xfer_descs(
+        self, xfer_desc: list[tuple[int, int, int]], mem_type: str
+    ) -> list[tuple[int, int, int]]:
+        self.xfer_desc_calls.append((xfer_desc, mem_type))
+        return xfer_desc
+
+    def prep_xfer_dlist(
+        self, agent_name: str, xfer_descs: list[tuple[int, int, int]], mem_type: str
+    ) -> str:
+        return f"xfer-{len(self.xfer_desc_calls)}"
+
+    def make_prepped_xfer(
+        self,
+        operation: str,
+        mem_xfer_handler: str,
+        mem_indices: list[int],
+        xfer_handler: str,
+        storage_indices: list[int],
+    ) -> str:
+        self.make_xfer_calls.append((operation, mem_indices, storage_indices))
+        return f"handle-{len(self.make_xfer_calls)}"
+
+    def transfer(self, handle: str) -> str:
+        return "DONE"
+
+    def release_xfer_handle(self, handle: str) -> None:
+        self.released_handles.append(handle)
+
+    def release_dlist_handle(self, xfer_handler: str) -> None:
+        self.released_dlists.append(xfer_handler)
+
+    def deregister_memory(self, reg_descs: str) -> None:
+        self.deregistered.append(reg_descs)
+
+    def query_memory(
+        self,
+        reg_list: list[tuple[int, int, int, str]],
+        backend: str,
+        mem_type: str,
+    ) -> list[object | None]:
+        self.query_memory_calls.append((reg_list, backend, mem_type))
+        return self.query_response
+
+
+def _make_object_storage_agent(
+    backend: str = "OBJ",
+) -> tuple[ObjectDynamicNixlStorageAgent, _FakeNixlApi]:
+    """Create an object agent shell backed by a fake NIXL API."""
+    nixl_api = _FakeNixlApi()
+    agent = object.__new__(ObjectDynamicNixlStorageAgent)
+    agent.backend = backend
+    agent.agent_name = "test-agent"
+    agent.l1_align_bytes = PAGE_SIZE
+    agent.mem_xfer_handler = "mem-xfer"
+    agent.nixl_agent = nixl_api
+    agent._device_id_counter = 0
+    agent._device_id_lock = threading.Lock()
+    return agent, nixl_api
+
+
+class _FakeObjectDynamicStorageAgent:
+    """Object storage agent fake used to verify adapter-level behavior."""
+
+    def __init__(self, page_size: int) -> None:
+        self.l1_align_bytes = page_size
+        self.existing_keys: set[ObjectKey] = set()
+        self.store_calls: list[tuple[list[int], ObjectKey]] = []
+        self.load_calls: list[tuple[list[int], ObjectKey]] = []
+        self.delete_calls: list[ObjectKey] = []
+        self.cleaned_up = False
+        self.closed = False
+
+    def get_memory_indices(self, raw_addr: int, mem_size: int) -> list[int]:
+        return [
+            raw_addr // self.l1_align_bytes + index
+            for index in range(mem_size // self.l1_align_bytes)
+        ]
+
+    async def dynamic_store(self, mem_indices: list[int], key: ObjectKey) -> None:
+        self.store_calls.append((mem_indices, key))
+        self.existing_keys.add(key)
+
+    async def dynamic_load(self, mem_indices: list[int], key: ObjectKey) -> None:
+        self.load_calls.append((mem_indices, key))
+
+    def dynamic_delete(self, key: ObjectKey) -> None:
+        self.delete_calls.append(key)
+
+    def get_stored_size(self, key: ObjectKey) -> int | None:
+        return 0 if key in self.existing_keys else None
+
+    def cleanup(self) -> None:
+        self.cleaned_up = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestObjectBackends:
+    """Tests for dynamic OBJ and AZURE_BLOB backends."""
+
+    @pytest.mark.parametrize(
+        "backend,backend_params",
+        [
+            ("OBJ", {"bucket": "test-bucket"}),
+            (
+                "AZURE_BLOB",
+                {
+                    "account_url": "https://example.blob.core.windows.net",
+                    "container_name": "test-container",
+                },
+            ),
+        ],
+    )
+    def test_config_accepts_object_backends_without_file_params(
+        self, backend: str, backend_params: dict[str, str]
+    ) -> None:
+        """Object backends accept their native parameters without file settings."""
+        config = DynamicNixlStoreL2AdapterConfig.from_dict(
+            {"backend": backend, "backend_params": backend_params}
+        )
+
+        assert config.backend == backend
+        assert config.backend_params == backend_params
+
+    def test_object_agent_registers_unique_device_ids(self) -> None:
+        """Each object transfer receives a distinct NIXL object device ID."""
+        agent, nixl_api = _make_object_storage_agent()
+        store_key = create_object_key(1)
+        load_key = create_object_key(2)
+
+        asyncio.run(agent.dynamic_store([3, 4], store_key))
+        asyncio.run(agent.dynamic_load([5], load_key))
+
+        assert nixl_api.register_memory_calls == [
+            ([(0, PAGE_SIZE * 2, 0, _object_key_to_filename(store_key))], "OBJ"),
+            ([(0, PAGE_SIZE, 1, _object_key_to_filename(load_key))], "OBJ"),
+        ]
+        assert nixl_api.xfer_desc_calls == [
+            ([(0, PAGE_SIZE, 0), (PAGE_SIZE, PAGE_SIZE, 0)], "OBJ"),
+            ([(0, PAGE_SIZE, 1)], "OBJ"),
+        ]
+        assert nixl_api.make_xfer_calls == [
+            ("WRITE", [3, 4], [0, 1]),
+            ("READ", [5], [0]),
+        ]
+        assert nixl_api.released_handles == ["handle-1", "handle-2"]
+        assert nixl_api.released_dlists == ["xfer-1", "xfer-2"]
+        assert nixl_api.deregistered == ["reg-1", "reg-2"]
+
+    @pytest.mark.parametrize("backend", ["OBJ", "AZURE_BLOB"])
+    def test_object_presence_query_uses_nixl_query_memory(self, backend: str) -> None:
+        """Object recovery queries NIXL with the configured object backend."""
+        agent, nixl_api = _make_object_storage_agent(backend)
+
+        assert agent.object_exists("obj-key")
+        nixl_api.query_response = [None]
+        assert not agent.object_exists("missing-key")
+
+        assert nixl_api.query_memory_calls == [
+            ([(0, 0, 0, "obj-key")], backend, "OBJ"),
+            ([(0, 0, 0, "missing-key")], backend, "OBJ"),
+        ]
+
+    @pytest.mark.parametrize("backend", ["OBJ", "AZURE_BLOB"])
+    def test_object_adapter_store_load_and_secondary_lookup(
+        self, monkeypatch: pytest.MonkeyPatch, backend: str
+    ) -> None:
+        """Object backends use generic storage-agent operations without eviction."""
+        buffer = torch.empty(PAGE_SIZE * NUM_BUFFER_PAGES, dtype=torch.uint8)
+        l1_memory = L1MemoryDesc(
+            ptr=buffer.data_ptr(),
+            size=buffer.numel(),
+            align_bytes=PAGE_SIZE,
+        )
+        agent = _FakeObjectDynamicStorageAgent(PAGE_SIZE)
+        monkeypatch.setattr(
+            dynamic_nixl_module,
+            "_create_dynamic_nixl_storage_agent",
+            lambda **kwargs: agent,
+        )
+        config = DynamicNixlStoreL2AdapterConfig(
+            backend=backend,
+            backend_params={"bucket": "test-bucket"},
+        )
+        adapter = DynamicNixlStoreL2Adapter(config, l1_memory)
+
+        assert not adapter.supports_global_eviction
+        assert adapter.get_usage().usage_fraction == -1.0
+
+        key = create_object_key(1)
+        store_obj = create_memory_obj(buffer, page_index=0)
+        task_id = adapter.submit_store_task([key], [store_obj])
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        assert adapter.pop_completed_store_tasks()[task_id].is_successful()
+        assert agent.store_calls == [([0], key)]
+
+        load_obj = create_memory_obj(buffer, page_index=1)
+        task_id = adapter.submit_load_task([key], [load_obj])
+        assert wait_for_event_fd(adapter.get_load_event_fd())
+        load_result = adapter.query_load_result(task_id)
+        assert load_result is not None
+        assert load_result.test(0)
+        assert agent.load_calls == [([1], key)]
+
+        recovered_key = create_object_key(2)
+        agent.existing_keys.add(recovered_key)
+        task_id = adapter.submit_lookup_and_lock_task(
+            [recovered_key], {0: _EMPTY_LAYOUT}
+        )
+        assert wait_for_event_fd(adapter.get_lookup_and_lock_event_fd())
+        lookup_result = adapter.query_lookup_and_lock_result(task_id)
+        assert lookup_result is not None
+        assert lookup_result.test(0)
+
+        adapter.delete([key])
+        assert agent.delete_calls == []
+        adapter.submit_unlock([key, recovered_key])
+        adapter.close()
+        assert agent.closed
+        assert not agent.cleaned_up
