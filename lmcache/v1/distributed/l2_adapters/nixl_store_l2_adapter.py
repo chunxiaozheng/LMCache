@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 # Standard
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
 import asyncio
@@ -37,6 +38,10 @@ from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.platform import create_event_notifier
 
 logger = init_logger(__name__)
+
+_FILE_NIXL_BACKENDS = ("GDS", "GDS_MT", "POSIX", "HF3FS")
+_OBJECT_NIXL_BACKENDS = ("OBJ", "AZURE_BLOB")
+_VALID_NIXL_BACKENDS = _FILE_NIXL_BACKENDS + _OBJECT_NIXL_BACKENDS
 
 # Main class
 
@@ -138,11 +143,10 @@ class NixlObjPool:
             return (usage, usage)
 
 
-class NixlStorageAgent:
-    agent_name: str
-    nixl_agent: NixlAgent
-    mem_reg_descs: nixlBind.nixlRegDList
-    mem_xfer_handler: NixlDlistHandle
+class NixlStorageAgent(ABC):
+    pool: NixlObjPool
+    storage_reg_descs: nixlBind.nixlRegDList
+    storage_xfer_handler: NixlDlistHandle
 
     def __init__(
         self,
@@ -151,7 +155,7 @@ class NixlStorageAgent:
         backend_params: dict[str, str],
         pool_size: int,
         l1_memory_desc: L1MemoryDesc,
-    ):
+    ) -> None:
         """
         Initialize the NixlStorageAgent.
 
@@ -185,31 +189,14 @@ class NixlStorageAgent:
             device_id=0,  # 0 indicates cpu
         )
 
-        if self.backend in ["GDS", "GDS_MT", "POSIX", "HF3FS"]:
-            file_size = int(
-                self.backend_params.get("file_size", l1_memory_desc.align_bytes)
-            )
-            pages_per_file = file_size // l1_memory_desc.align_bytes
-            self.pool = NixlObjPool(num_total_objs=self.pool_size * pages_per_file)
-            self.init_storage_handlers_file(
-                num_files=self.pool_size,
-                page_size=l1_memory_desc.align_bytes,
-                file_size=file_size,
-                file_path=self.backend_params["file_path"],
-                # TODO(Jiayi): Need to make argument parsing more elegant
-                use_direct_io=str(self.backend_params["use_direct_io"]).lower()
-                == "true",
-            )
-        elif self.backend in ["OBJ", "AZURE_BLOB"]:
-            self.pool = NixlObjPool(num_total_objs=self.pool_size)
-            self.init_storage_handlers_object(
-                page_size=l1_memory_desc.align_bytes,
-                num_pages=self.pool_size,
-            )
-        else:
-            raise TypeError(f"Unsupported backend type: {self.backend}")
-
-    def init_mem_handlers(self, device, buffer_ptr, buffer_size, page_size, device_id):
+    def init_mem_handlers(
+        self,
+        device: str,
+        buffer_ptr: int,
+        buffer_size: int,
+        page_size: int,
+        device_id: int,
+    ) -> None:
         """
         Initialize memory handlers for the given device and buffer.
         """
@@ -233,106 +220,9 @@ class NixlStorageAgent:
         self.mem_reg_descs = reg_descs
         self.mem_xfer_handler = xfer_handler
 
-    def init_storage_handlers_file(
-        self,
-        num_files: int,
-        page_size: int,
-        file_size: int,
-        file_path: str,
-        use_direct_io: bool,
-    ):
-        """Initialize storage handlers for file-based backends.
-
-        Each file holds ``file_size // page_size`` pages at successive offsets.
-        ``file_size`` must be a multiple of ``page_size``.
-
-        Args:
-            num_files: Number of storage files to create.
-            page_size: Granularity of L1 memory pages (transfer unit size).
-            file_size: Size in bytes of each storage file. Must be a multiple
-                of ``page_size``.
-            file_path: Directory where storage files are created.
-            use_direct_io: Whether to open files with O_DIRECT.
-        """
-        os.makedirs(file_path, exist_ok=True)
-        if file_size % page_size != 0:
-            raise ValueError(
-                f"file_size ({file_size}) must be a multiple of page_size ({page_size})"
-            )
-
-        pages_per_file = file_size // page_size
-        num_pages = num_files * pages_per_file
-
-        # Create file descriptors for Nixl to register
-        fds: list[int] = []
-        flags = os.O_CREAT | os.O_RDWR
-        if use_direct_io:
-            if hasattr(os, "O_DIRECT"):
-                flags |= os.O_DIRECT
-            else:
-                logger.warning(
-                    "use_direct_io is True, but O_DIRECT is not available on "
-                    "this system. Falling back to buffered I/O."
-                )
-        for i in range(num_files):
-            filename = f"obj_{i}_{uuid.uuid4().hex[0:4]}.bin"
-            tmp_path = os.path.join(file_path, filename)
-            fd = os.open(tmp_path, flags)
-            fds.append(fd)
-
-        # Register each file covering the full file_size.
-        # Build one xfer_desc entry per page slot (page index i maps to
-        # offset (i % pages_per_file) * page_size inside fd[i // pages_per_file]).
-        reg_list = []
-        xfer_desc = []
-        for fd in fds:
-            reg_list.append((0, file_size, fd, ""))
-        for page_idx in range(num_pages):
-            fd = fds[page_idx // pages_per_file]
-            offset = (page_idx % pages_per_file) * page_size
-            xfer_desc.append((offset, page_size, fd))
-        reg_descs = self.nixl_agent.register_memory(reg_list, mem_type="FILE")
-        xfer_descs = self.nixl_agent.get_xfer_descs(xfer_desc, mem_type="FILE")
-        xfer_handler = self.nixl_agent.prep_xfer_dlist(
-            self.agent_name, xfer_descs, mem_type="FILE"
-        )
-
-        self.storage_fds = fds
-        self.storage_reg_descs = reg_descs
-        self.storage_xfer_descs = xfer_descs
-        self.storage_xfer_handler = xfer_handler
-
-    def init_storage_handlers_object(
-        self,
-        page_size: int,
-        num_pages: int,
-    ):
-        """Initialize storage handlers for object-based backends."""
-
-        # Create object keys for Nixl to register
-        keys = []
-
-        for i in range(num_pages):
-            key = f"obj_{i}_{uuid.uuid4().hex[0:4]}"
-            keys.append(key)
-
-        # Register and prepare xfer handler
-        reg_list = []
-        xfer_desc = []
-        for i, key in enumerate(keys):
-            reg_list.append((0, page_size, i, key))
-            xfer_desc.append((0, page_size, i))
-        reg_descs = self.nixl_agent.register_memory(reg_list, mem_type="OBJ")
-        xfer_descs = self.nixl_agent.get_xfer_descs(xfer_desc, mem_type="OBJ")
-        xfer_handler = self.nixl_agent.prep_xfer_dlist(
-            self.agent_name, xfer_descs, mem_type="OBJ"
-        )
-
-        self.storage_reg_descs = reg_descs
-        self.storage_xfer_descs = xfer_descs
-        self.storage_xfer_handler = xfer_handler
-
-    def get_mem_to_storage_handle(self, mem_indices, storage_indices) -> NixlXferHandle:
+    def get_mem_to_storage_handle(
+        self, mem_indices: list[int], storage_indices: list[int]
+    ) -> NixlXferHandle:
         """Get a Nixl transfer handle for transferring data from memory to storage."""
 
         return self.nixl_agent.make_prepped_xfer(
@@ -343,7 +233,9 @@ class NixlStorageAgent:
             storage_indices,
         )
 
-    def get_storage_to_mem_handle(self, mem_indices, storage_indices) -> NixlXferHandle:
+    def get_storage_to_mem_handle(
+        self, mem_indices: list[int], storage_indices: list[int]
+    ) -> NixlXferHandle:
         """Get a Nixl transfer handle for transferring data from storage to memory."""
         return self.nixl_agent.make_prepped_xfer(
             "READ",
@@ -353,7 +245,7 @@ class NixlStorageAgent:
             storage_indices,
         )
 
-    def post_blocking(self, handle: NixlXferHandle):
+    def post_blocking(self, handle: NixlXferHandle) -> None:
         """Post a Nixl transfer handle and block until the transfer is done."""
 
         state = self.nixl_agent.transfer(handle)
@@ -367,7 +259,7 @@ class NixlStorageAgent:
         if state == "ERR":
             raise RuntimeError("NIXL transfer failed")
 
-    async def post_non_blocking(self, handle: NixlXferHandle):
+    async def post_non_blocking(self, handle: NixlXferHandle) -> None:
         """Post a Nixl transfer handle and await until the transfer is done."""
 
         state = self.nixl_agent.transfer(handle)
@@ -405,16 +297,136 @@ class NixlStorageAgent:
         num_pages = mem_size // self.l1_align_bytes
         return [(raw_addr // self.l1_align_bytes + i) for i in range(num_pages)]
 
-    def release_handle(self, handle):
+    def release_handle(self, handle: NixlXferHandle) -> None:
         self.nixl_agent.release_xfer_handle(handle)
 
-    def close(self):
+    def close(self) -> None:
         self.nixl_agent.release_dlist_handle(self.storage_xfer_handler)
         self.nixl_agent.release_dlist_handle(self.mem_xfer_handler)
         self.nixl_agent.deregister_memory(self.storage_reg_descs)
         self.nixl_agent.deregister_memory(self.mem_reg_descs)
         for fd in getattr(self, "storage_fds", []):
             os.close(fd)
+
+    @abstractmethod
+    def init_storage_handlers(self) -> None:
+        """Register this agent's pre-allocated storage with NIXL."""
+
+
+class FileNixlStorageAgent(NixlStorageAgent):
+    """Static NIXL storage agent that pre-allocates file descriptors."""
+
+    def __init__(
+        self,
+        device: str,
+        backend: str,
+        backend_params: dict[str, str],
+        pool_size: int,
+        l1_memory_desc: L1MemoryDesc,
+    ) -> None:
+        super().__init__(device, backend, backend_params, pool_size, l1_memory_desc)
+        self.file_path = backend_params["file_path"]
+        self.file_size = int(
+            backend_params.get("file_size", l1_memory_desc.align_bytes)
+        )
+        self.use_direct_io = str(backend_params["use_direct_io"]).lower() == "true"
+        if self.file_size % l1_memory_desc.align_bytes != 0:
+            raise ValueError(
+                "file_size (%d) must be a multiple of page_size (%d)"
+                % (self.file_size, l1_memory_desc.align_bytes)
+            )
+        self.pages_per_file = self.file_size // l1_memory_desc.align_bytes
+        self.pool = NixlObjPool(num_total_objs=pool_size * self.pages_per_file)
+        self.init_storage_handlers()
+
+    def init_storage_handlers(self) -> None:
+        """Create, register, and prepare the pre-allocated storage files."""
+        os.makedirs(self.file_path, exist_ok=True)
+        fds: list[int] = []
+        flags = os.O_CREAT | os.O_RDWR
+        if self.use_direct_io:
+            if hasattr(os, "O_DIRECT"):
+                flags |= os.O_DIRECT
+            else:
+                logger.warning(
+                    "use_direct_io is True, but O_DIRECT is not available on "
+                    "this system. Falling back to buffered I/O."
+                )
+        for index in range(self.pool_size):
+            filename = f"obj_{index}_{uuid.uuid4().hex[0:4]}.bin"
+            fd = os.open(os.path.join(self.file_path, filename), flags)
+            fds.append(fd)
+
+        reg_list = [(0, self.file_size, fd, "") for fd in fds]
+        xfer_desc = []
+        for page_index in range(self.pool.total_objs):
+            fd = fds[page_index // self.pages_per_file]
+            offset = (page_index % self.pages_per_file) * self.l1_align_bytes
+            xfer_desc.append((offset, self.l1_align_bytes, fd))
+        self.storage_reg_descs = self.nixl_agent.register_memory(
+            reg_list, mem_type="FILE"
+        )
+        self.storage_xfer_descs = self.nixl_agent.get_xfer_descs(
+            xfer_desc, mem_type="FILE"
+        )
+        self.storage_xfer_handler = self.nixl_agent.prep_xfer_dlist(
+            self.agent_name, self.storage_xfer_descs, mem_type="FILE"
+        )
+        self.storage_fds = fds
+
+
+class ObjectNixlStorageAgent(NixlStorageAgent):
+    """Static NIXL storage agent that pre-registers object descriptors."""
+
+    def __init__(
+        self,
+        device: str,
+        backend: str,
+        backend_params: dict[str, str],
+        pool_size: int,
+        l1_memory_desc: L1MemoryDesc,
+    ) -> None:
+        super().__init__(device, backend, backend_params, pool_size, l1_memory_desc)
+        self.pool = NixlObjPool(num_total_objs=pool_size)
+        self.init_storage_handlers()
+
+    def init_storage_handlers(self) -> None:
+        """Register and prepare the pre-allocated object descriptors."""
+        keys = [
+            f"obj_{index}_{uuid.uuid4().hex[0:4]}" for index in range(self.pool_size)
+        ]
+        reg_list = [
+            (0, self.l1_align_bytes, index, key) for index, key in enumerate(keys)
+        ]
+        xfer_desc = [(0, self.l1_align_bytes, index) for index in range(self.pool_size)]
+        self.storage_reg_descs = self.nixl_agent.register_memory(
+            reg_list, mem_type="OBJ"
+        )
+        self.storage_xfer_descs = self.nixl_agent.get_xfer_descs(
+            xfer_desc, mem_type="OBJ"
+        )
+        self.storage_xfer_handler = self.nixl_agent.prep_xfer_dlist(
+            self.agent_name, self.storage_xfer_descs, mem_type="OBJ"
+        )
+
+
+def _create_nixl_storage_agent(
+    device: str,
+    backend: str,
+    backend_params: dict[str, str],
+    pool_size: int,
+    l1_memory_desc: L1MemoryDesc,
+) -> NixlStorageAgent:
+    """Create the static storage agent for a NIXL backend family."""
+    if backend in _FILE_NIXL_BACKENDS:
+        return FileNixlStorageAgent(
+            device, backend, backend_params, pool_size, l1_memory_desc
+        )
+    if backend in _OBJECT_NIXL_BACKENDS:
+        return ObjectNixlStorageAgent(
+            device, backend, backend_params, pool_size, l1_memory_desc
+        )
+    raise ValueError(f"No NIXL storage agent for backend {backend!r}")
 
 
 class NixlStoreL2Adapter(L2AdapterInterface):
@@ -436,7 +448,7 @@ class NixlStoreL2Adapter(L2AdapterInterface):
         # backend allocated; we then forward the byte capacity to the base
         # class so ``get_usage()`` / ``supports_global_eviction`` reflect the real
         # storage size.
-        self.nixl_agent = NixlStorageAgent(
+        self.nixl_agent = _create_nixl_storage_agent(
             device="cpu",
             backend=config.backend,
             backend_params=config.backend_params,
@@ -911,16 +923,6 @@ class NixlStoreL2Adapter(L2AdapterInterface):
 # Config and self-registration
 # ---------------------------------------------------------------------
 
-_VALID_NIXL_BACKENDS = (
-    "GDS",
-    "GDS_MT",
-    "POSIX",
-    "HF3FS",
-    "OBJ",
-    "AZURE_BLOB",
-)
-_FILE_BACKENDS = ("GDS", "GDS_MT", "POSIX", "HF3FS")
-
 
 class NixlStoreL2AdapterConfig(L2AdapterConfigBase):
     """
@@ -945,7 +947,7 @@ class NixlStoreL2AdapterConfig(L2AdapterConfigBase):
         backend_params: dict[str, str],
         pool_size: int,
     ):
-        if backend in _FILE_BACKENDS:
+        if backend in _FILE_NIXL_BACKENDS:
             if "file_path" not in backend_params:
                 raise ValueError(
                     "backend_params must include "

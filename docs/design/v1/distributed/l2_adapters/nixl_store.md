@@ -36,13 +36,16 @@ storage slots (`pool_size` entries). Slots are allocated before a store and
 freed after a failed transfer or when the object is evicted.
 
 #### `NixlStorageAgent`
-Thin wrapper around the Nixl agent API. Responsibilities:
+Abstract base for static Nixl storage agents. Responsibilities:
 - Register the L1 memory buffer with Nixl (`init_mem_handlers`).
-- Register storage slots (files or object keys) with Nixl
-  (`init_storage_handlers_file` / `init_storage_handlers_object`).
 - Produce pre-prepared transfer handles for batched DMA reads/writes
   (`get_mem_to_storage_handle`, `get_storage_to_mem_handle`).
 - Drive transfers asynchronously (`post_non_blocking`).
+
+`FileNixlStorageAgent` and `ObjectNixlStorageAgent` each implement the shared
+`init_storage_handlers()` interface to register their pre-allocated file or
+object descriptors. The adapter selects the subclass from the configured
+backend family.
 
 #### `NixlStoreL2Adapter`
 The public adapter implementing `L2AdapterInterface`. It owns:

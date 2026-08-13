@@ -9,6 +9,7 @@ Tests only use public methods and do not access private fields.
 # Standard
 from unittest.mock import call, patch
 import errno
+import inspect
 import os
 import select
 import shutil
@@ -41,26 +42,29 @@ from lmcache.v1.distributed.internal_api import (  # noqa: E402
     L2AdapterListener,
 )
 from lmcache.v1.distributed.l2_adapters.nixl_store_l2_adapter import (  # noqa: E402
+    FileNixlStorageAgent,
+    NixlStorageAgent,
     NixlStoreL2Adapter,
     NixlStoreL2AdapterConfig,
+    ObjectNixlStorageAgent,
 )
 
 
 class _RecordingListener(L2AdapterListener):
     """Listener that records all events for inspection in tests."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.stored: list[list[ObjectKey]] = []
         self.accessed: list[list[ObjectKey]] = []
         self.deleted: list[list[ObjectKey]] = []
 
-    def on_l2_keys_stored(self, keys: list[ObjectKey], sizes: list[int]):
+    def on_l2_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
         self.stored.append(list(keys))
 
-    def on_l2_keys_accessed(self, keys: list[ObjectKey]):
+    def on_l2_keys_accessed(self, keys: list[ObjectKey]) -> None:
         self.accessed.append(list(keys))
 
-    def on_l2_keys_deleted(self, keys: list[ObjectKey]):
+    def on_l2_keys_deleted(self, keys: list[ObjectKey]) -> None:
         self.deleted.append(list(keys))
 
 
@@ -181,6 +185,27 @@ def adapter():
 
     adapter.close()
     shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# =============================================================================
+# Storage Agent Tests
+# =============================================================================
+
+
+class TestStorageAgents:
+    """Tests for static NIXL storage-agent specialization."""
+
+    def test_storage_agent_base_is_abstract(self) -> None:
+        """Only a backend-specific storage agent can be instantiated."""
+        assert inspect.isabstract(NixlStorageAgent)
+        assert not inspect.isabstract(FileNixlStorageAgent)
+        assert not inspect.isabstract(ObjectNixlStorageAgent)
+
+    def test_file_backend_creates_file_storage_agent(self, adapter) -> None:
+        """A POSIX backend selects the file storage-agent implementation."""
+        adpt, _ = adapter
+
+        assert isinstance(adpt.nixl_agent, FileNixlStorageAgent)
 
 
 # =============================================================================
