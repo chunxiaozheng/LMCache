@@ -4,6 +4,7 @@
 # Standard
 from types import ModuleType
 from unittest.mock import Mock, patch
+import threading
 import unittest
 
 # Third Party
@@ -73,6 +74,18 @@ class _IPCCacheServerKey:
         self.__dict__.update(kwargs)
 
 
+def _new_connector() -> UnifiedLMCacheMPConnector:
+    """Create a healthy connector shell for server-free unit tests."""
+    connector = object.__new__(UnifiedLMCacheMPConnector)
+    connector._health_event = threading.Event()
+    connector._health_event.set()
+    connector.tp_size = 1
+    connector.pp_size = 1
+    connector.tp_group = None
+    connector.pp_group = None
+    return connector
+
+
 class TestUnifiedLMCacheMPConnector(unittest.TestCase):
     def setUp(self):
         heartbeat_patcher = patch.object(
@@ -80,7 +93,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         )
         heartbeat_patcher.start()
         self.addCleanup(heartbeat_patcher.stop)
-        self.connector = object.__new__(UnifiedLMCacheMPConnector)
+        self.connector = _new_connector()
         self.connector.page_size = 4
 
     def test_slots_to_blocks_accepts_noncontiguous_pages(self):
@@ -147,6 +160,145 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertIs(
             all_reduce.call_args_list[1].kwargs["group"], self.connector.pp_group
         )
+
+    def test_health_check_marks_connector_unhealthy_on_ping_failure(self):
+        connector = _new_connector()
+        connector._heartbeat_stop = threading.Event()
+        connector._closed = False
+        connector._heartbeat_interval = 1.0
+        connector.instance_id = 7
+        connector._req_client = Mock()
+        connector._req_client.ping.return_value.result.side_effect = TimeoutError
+        connector._reregister_kv_cache_after_recovery = Mock(return_value=True)
+
+        connector._run_health_check()
+
+        self.assertFalse(connector.is_healthy)
+        connector._reregister_kv_cache_after_recovery.assert_not_called()
+
+    def test_health_check_reregisters_before_marking_recovered(self):
+        connector = _new_connector()
+        connector._health_event.clear()
+        connector._heartbeat_stop = threading.Event()
+        connector._closed = False
+        connector._heartbeat_interval = 1.0
+        connector.instance_id = 7
+        connector._req_client = Mock()
+        connector._req_client.ping.return_value.result.return_value = True
+        connector._reregister_kv_cache_after_recovery = Mock(return_value=True)
+
+        connector._run_health_check()
+
+        connector._reregister_kv_cache_after_recovery.assert_called_once_with()
+        self.assertTrue(connector.is_healthy)
+
+    def test_failed_recovery_keeps_connector_unhealthy(self):
+        connector = _new_connector()
+        connector._health_event.clear()
+        connector._heartbeat_stop = threading.Event()
+        connector._closed = False
+        connector._heartbeat_interval = 1.0
+        connector.instance_id = 7
+        connector._req_client = Mock()
+        connector._req_client.ping.return_value.result.return_value = True
+        connector._reregister_kv_cache_after_recovery = Mock(return_value=False)
+
+        connector._run_health_check()
+
+        self.assertFalse(connector.is_healthy)
+
+    def test_recovery_reregisters_and_resets_store_progress(self):
+        connector = _new_connector()
+        connector._heartbeat_stop = threading.Event()
+        connector._closed = False
+        connector._registered = True
+        connector._send_register_kv_cache_request = Mock()
+        lookup = LMCacheLookupOperation(
+            request_id="request",
+            token_ids=[1, 2, 3, 4],
+            local_hit_tokens=0,
+            cache_salt="",
+            submission_future=object(),
+            completion_future=object(),
+            locks_held=True,
+        )
+        connector._lookups = {lookup.request_id: lookup}
+        connector._active_sessions = {lookup.request_id}
+        connector._store_submitted_tokens = {lookup.request_id: 4}
+
+        connector._mark_unhealthy()
+        self.assertTrue(connector._reregister_kv_cache_after_recovery())
+
+        connector._send_register_kv_cache_request.assert_called_once_with()
+        self.assertIs(connector._lookups[lookup.request_id], lookup)
+        self.assertEqual(connector._active_sessions, {lookup.request_id})
+        self.assertEqual(connector._store_submitted_tokens, {})
+
+    def test_unhealthy_lookup_is_a_synchronized_cache_miss(self):
+        self.connector._health_event.clear()
+        self.connector.chunk_size = 4
+        self.connector._lookups = {}
+        self.connector._active_sessions = set()
+        self.connector._req_client = Mock()
+
+        operation = self.connector.submit_lookup(
+            "request",
+            [1, 2, 3, 4],
+            local_hit_tokens=0,
+            cache_salt="",
+        )
+
+        self.assertEqual(operation.total_hit_tokens, 0)
+        self.connector._req_client.lookup.assert_not_called()
+        self.assertNotIn("request", self.connector._active_sessions)
+
+    def test_cross_rank_health_failure_propagates_locally(self):
+        connector = _new_connector()
+
+        with patch.object(connector, "_sync_success", return_value=False) as sync:
+            self.assertFalse(connector._all_ranks_healthy())
+
+        sync.assert_called_once_with(True)
+        self.assertFalse(connector.is_healthy)
+
+    def test_unhealthy_store_is_not_submitted(self):
+        connector = _new_connector()
+        connector._health_event.clear()
+
+        operation = connector.submit_store(
+            "request",
+            [1, 2, 3, 4],
+            torch.arange(4),
+            cache_salt="",
+        )
+
+        self.assertIsNone(operation)
+
+    def test_unhealthy_load_returns_failed_placeholder(self):
+        connector = _new_connector()
+        connector._health_event.clear()
+        connector.chunk_size = 4
+        connector._kv_groups = (
+            SGLangKVComponentGroup("full", (), tokens_per_block=4, slots_per_block=4),
+        )
+        lookup = LMCacheLookupOperation(
+            request_id="request",
+            token_ids=[1, 2, 3, 4],
+            local_hit_tokens=0,
+            cache_salt="",
+            total_hit_tokens=4,
+            locks_held=True,
+        )
+
+        operation = connector.submit_load(
+            lookup,
+            torch.arange(4),
+            local_hit_tokens=0,
+        )
+
+        self.assertTrue(operation.query())
+        self.assertFalse(operation.future.result())
+        self.assertFalse(lookup.locks_held)
 
     def test_aligned_empty_lookup_does_not_send_end_session(self):
         self.connector.chunk_size = 8
@@ -299,7 +451,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertEqual(wire.data_ptr(), tensor.data_ptr())
 
     def test_group_info_specs_preserve_component_address_spaces(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _new_connector()
         connector.page_size = 4
         connector._kv_groups = (
             SGLangKVComponentGroup(
@@ -332,7 +484,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertEqual([spec["sw_size_tokens"] for spec in specs], [-1, 8, 8])
 
     def test_group_info_specs_mark_mamba_as_recurrent_one_block_window(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _new_connector()
         connector._kv_groups = (
             SGLangKVComponentGroup(
                 "mamba",
@@ -352,7 +504,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertTrue(specs[0]["recurrent_state"])
 
     def test_group_info_specs_keep_dsa_sidecar_in_full_address_space(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _new_connector()
         connector._kv_groups = (
             SGLangKVComponentGroup(
                 "full",
@@ -373,7 +525,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertEqual([spec["engine_group_id"] for spec in specs], [0, 0])
 
     def test_submit_store_passes_list_of_block_ids_per_group(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _new_connector()
         connector.page_size = 4
         connector.chunk_size = 8
         connector.blocks_in_chunk = 2
@@ -414,7 +566,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertEqual(connector._create_key.call_args.kwargs["worker_id"], 0)
 
     def test_mla_non_writer_uses_collective_placeholder(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _new_connector()
         connector.page_size = 4
         connector.chunk_size = 8
         connector.blocks_in_chunk = 2
@@ -448,7 +600,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertIn("request", connector._active_sessions)
 
     def test_submit_store_accepts_all_null_historical_swa_chunk(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _new_connector()
         connector.page_size = 4
         connector.chunk_size = 8
         connector.blocks_in_chunk = 2
@@ -493,7 +645,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         )
 
     def test_submit_store_defers_partly_unmapped_retained_swa_chunk(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _new_connector()
         connector.page_size = 4
         connector.chunk_size = 8
         connector._kv_groups = (
@@ -527,7 +679,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertNotIn("request", connector._store_submitted_tokens)
 
     def test_submit_store_accepts_dummy_mamba_blocks(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _new_connector()
         connector.page_size = 1
         connector.chunk_size = 8
         connector.blocks_in_chunk = 8
@@ -570,7 +722,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         )
 
     def test_submit_load_uses_compressed_mamba_block_ids(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _new_connector()
         connector.page_size = 1
         connector.chunk_size = 8
         connector.blocks_in_chunk = 8
@@ -615,7 +767,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertEqual(operation.end, 8)
 
     def test_prepare_load_orders_forward_stream_without_completing_future(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _new_connector()
         connector._mq_timeout = 10
         connector._sync_success = lambda success: success
         lookup = LMCacheLookupOperation(
@@ -644,7 +796,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertTrue(lookup.locks_held)
 
     def test_free_lookup_locks_sends_one_leader_prefix_range(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _new_connector()
         connector._lookup_leader = True
         connector.kv_world_size = 2
         connector._req_client = Mock()
@@ -671,7 +823,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertIs(connector._lookups["request"], lookup)
 
     def test_complete_load_relies_on_retrieve_to_release_read_locks(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _new_connector()
         connector._sync_success = lambda success: success
         connector._free_lookup_locks = Mock()
         lookup = LMCacheLookupOperation(
