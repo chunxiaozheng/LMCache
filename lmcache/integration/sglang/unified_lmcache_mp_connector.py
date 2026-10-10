@@ -449,6 +449,11 @@ class UnifiedLMCacheMPConnector:
     def operation_timeout(self) -> float:
         return self._mq_timeout
 
+    @property
+    def kv_groups(self) -> tuple[SGLangKVComponentGroup, ...]:
+        """Return the engine-group geometry exposed to SGLang linkers."""
+        return tuple(self._kv_groups)
+
     @staticmethod
     def build_cache_salt(cache_salt: Optional[str], extra_key: Optional[str]) -> str:
         """Combine SGLang's salt and extra key into one LMCache namespace."""
