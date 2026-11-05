@@ -1,7 +1,7 @@
 # Worker Liveness Tracking and Reaping (Multiprocess Mode)
 
-Covers the MP server (`lmcache/v1/multiprocess/`) and the worker heartbeat in
-the vLLM multiprocess adapter.
+Covers the MP server (`lmcache/v1/multiprocess/`) and the shared client
+heartbeat used by the vLLM, SGLang, and ATOM multiprocess adapters.
 
 ## 1. Problem
 
@@ -141,6 +141,7 @@ the worker adapter warns at startup when `3 x interval` exceeds the 30 s floor.
 
 ### 6.1 Lazy start
 
+<<<<<<< HEAD
 The heartbeat keeps its lazy start on first store/retrieve — no pings during
 warmup; the registration grace covers that window. It starts healthy (the event
 is set at construction), so the first store/retrieve is not gated. A live worker
@@ -149,6 +150,17 @@ reaped while alive — no re-registration is needed at start. The recover callba
 re-registers only on a genuine recovery edge (Section 6.2). A retrieve dropped
 while the server is unhealthy is still reported via `get_finished` so async loads
 cannot hang.
+=======
+The shared heartbeat does not choose its start time. vLLM and SGLang keep their
+lazy start on the first cache operation, while ATOM starts after successful
+KV-cache registration. The registration grace covers the lazy-start warmup
+window. Each adapter starts its heartbeat healthy, so initial work is not gated.
+A live worker then pings every interval, refreshing its server-side `last_seen`,
+so it is never reaped while alive. The recover callback re-registers only on a
+genuine recovery edge (Section 6.2). vLLM and SGLang report or return failed
+placeholders for cache work dropped while unhealthy, so their schedulers can
+recompute instead of hanging.
+>>>>>>> 53c4428e ([SGLang] Support health check in sglang connector)
 
 ### 6.2 Recovery after a reap
 
@@ -166,7 +178,7 @@ builds nothing — the server never asks a worker to re-register.
 
 ### 6.3 Shutdown
 
-`shutdown()` stops the heartbeat before sending UNREGISTER, so no stray ping
+Adapter shutdown stops the heartbeat before sending UNREGISTER, so no stray ping
 lands on a closing client. The heartbeat cycle skips the recover callback and
 `health_event.set()` once stopped, and the callback skips re-registration when a
 stop is already requested — a straggling cycle cannot re-create a ghost context.
